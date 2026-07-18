@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "orange-fur"
+version = "0.7.0"
+description = "Generative Csound orchestra + score, offline render"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+orange-fur = "orange_fur.cli:main"
+
+[tool.setuptools]
+packages = ["orange_fur"]
+
+[tool.setuptools.package-data]
+orange_fur = ["data/*.scl"]

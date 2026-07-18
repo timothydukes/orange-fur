@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.wav
+*.csd
+*.96k.wav
+out/
+.DS_Store
