@@ -62,8 +62,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="global dry <-> effects-return crossfade")
     p.add_argument("--subset", type=_ranged(SUBSET_MIN, SUBSET_MAX), default=50.0,
                    metavar="PCT",
-                   help="percent of the generated orchestra used in this score "
-                        "(no effect until Phase 3)")
+                   help="percent of the generated orchestra used in this score")
     p.add_argument("--normalize", type=float, default=-3.0, metavar="DBFS",
                    help="target peak ceiling; amplitudes are scaled at score "
                         "time to land here")
