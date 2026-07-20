@@ -86,7 +86,7 @@ def test_note_count():
         cfg = Config(nodes=n, duration=3)
         ev = _events(cfg, random.Random(1))
         check(f"score: event count within 35% of the N**2 budget",
-              abs(len(ev) - n * n) <= max(12, 0.35 * n * n), (len(ev), n * n))
+              abs(sum(1 for _e in ev if _e.echo == 0) - n * n) <= max(12, 0.35 * n * n), (sum(1 for _e in ev if _e.echo == 0), n * n))
         # Phase 0 asserted start+dur <= duration. That is the wrong invariant
         # now: a 40-second swell in the outro MUST be allowed to ring past the
         # end of the piece, which is the whole point of the carrier. The real
@@ -115,8 +115,11 @@ def test_amplitude():
         ceiling = 10 ** (cfg.normalize / 20)
         check(f"amp: nodes={nodes} predicted peak hits the ceiling",
               abs(st["predicted_peak"] * st["gain"] - ceiling) < 1e-6)
-        check(f"amp: nodes={nodes} no event exceeds 0dbfs",
-              max(e.amp for e in ev) <= 1.0,
+        # Phase 9 amendment: amp is DRIVE into a float pipeline whose output
+        # level is set exactly post-render; the old <= 1.0 bound predates
+        # that. 2.0 is a sanity rail against model blowups, not a level.
+        check(f"amp: nodes={nodes} drive within sanity bound (2x 0dbfs)",
+              max(e.amp for e in ev) <= 2.0,
               max(e.amp for e in ev))
     # Monotonicity, tested on SYNTHETIC events so the placeholder's own
     # regime-switching (it swaps to shorter, quieter material above ~20
@@ -131,7 +134,7 @@ def test_amplitude():
                     amp=0.8, pan=0.5, send=0.3, slew=0.5)
               for i in range(voices)]
         compensate(ev, cfg)
-        means.append(sum(e.amp for e in ev) / len(ev))
+        means.append(sum(e.amp for e in ev) / sum(1 for _e in ev if _e.echo == 0))
     check("amp: per-note amplitude falls monotonically with voice count",
           all(means[i] > means[i + 1] for i in range(len(means) - 1)),
           [f"{m:.4f}" for m in means])

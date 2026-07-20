@@ -17,9 +17,11 @@ density, cost — without rendering a sample.
 
 - **The score is exactly `nodes²` notes** (before density-track culling and
   the occasional bridge swell). Duration does not add notes; it spreads them.
-- **Every run is a different piece.** The RNG is entropy-seeded; `--seed` is
-  a filename tag only. The `.txt` manifest written beside each render is the
-  only record of what a run drew — archive it with the wav.
+- **Every fresh run is a different piece — and every piece is recoverable.**
+  One 64-bit entropy seed governs all draws; the report and manifest print it
+  as a replay token (`VERSION:HEX`), and `--replay TOKEN` regenerates that
+  exact piece under the same code version. `--seed` remains a filename tag
+  only. Archive the manifest with the wav: it is the piece's recipe.
 - **Output level is exact.** Peak is set post-render to `--normalize`
   (default −3 dBFS) by a single lossless float rescale. No limiter, no
   clipper, anywhere.
@@ -69,6 +71,108 @@ Notes:
   nodes 60–150.
 
 ---
+
+## 1b. Echo — `--echo`
+
+The score-domain delay line. Each section draws a delay treatment — mode
+(plain repeat, degree cascade, octave spiral, cents drift), delay time
+(100–1000 ms), feedback — and a drawn fraction of its phrases spawn decaying
+echo trains: every echo is a fresh *note*, on the tuning (or deliberately a
+few cents off it, via the new p12 detune field), visible to the amp model,
+the cost router, and the manifest.
+
+| flag | range | default | notes |
+|---|---|---|---|
+| `--echo SCALE` | 0–3 | 1.0 | scales each section's drawn echo probability. **Remix-class flag**: the source composition is identical at every setting under the same replay token — 0 strips the echoes, 2–3 saturates them. |
+
+```
+# the same piece, three densities of its own echo
+python3 -m orange_fur --replay TOKEN --echo 0 --draft --out dry.wav
+python3 -m orange_fur --replay TOKEN            --draft --out asdrawn.wav
+python3 -m orange_fur --replay TOKEN --echo 2.5 --draft --out saturated.wav
+```
+
+Notes: echo trains are where the piece acquires a pulse — 100–1000 ms is the
+rhythm band. The `echoes` report line names each section's treatment; cents
+mode is a delay whose feedback path is a microscopic transposer, beating
+against the dry notes. Echoes multiply the event count (they are decoration
+on top of the N² source budget); cost routing absorbs the render cost.
+
+Two further drawn properties (no flags): about a third of sections carry a
+**rotating-timbre delay** — `rot(3)` in the report — where each echo
+generation cycles to the next instrument of a drawn cycle from the source's
+own category, INSTR_PEAK-compensated so the heard decay still follows the
+feedback curve. Pitch and rhythm stay strict while the color rotates: a
+klangfarben echo, which no audio delay can do. And a drawn **decay-time
+gesture** (`tails:up` / `down` / `arch`) shapes train length across the
+section — echo tails lengthen toward a climax or dry out with the phrase.
+
+## 1c. Tape loops (no flag — drawn)
+
+Rarely — gong-class rarity, roughly one section in six — a section carries a
+**phasing tape-loop process**: two (occasionally three) loop voices of the
+same 2–5-note cell at periods T and T(1+ε), near-100% feedback, panned
+apart. The accumulating offset is the phasing: the cell slides against
+itself through every intermediate canon, and when the drawn ε permits, the
+voices audibly realign before the loop ends. The report predicts the
+moment: `tape loop [VERSE] … realign at +38.7s (inside the loop)`.
+
+Loops are *protected processes*: density culling, register stepping, and
+per-note voice rebinding do not touch them (a loop's identity is its
+unvarying cell); the macro accent contour still shapes their loudness, and
+cost routing moves a whole loop atomically if it moves at all. There is no
+flag: loops are part of the composition and ride the replay token.
+
+## 1d. Motifs (no flag — drawn)
+
+The piece now has a memory. The first few qualifying phrases it emits (3–6
+notes, under 8 s) are captured as **motifs**, and later sections re-quote
+them transformed — transposed, inverted, retrograded, augmented. Quotation
+is L1-driven: CHORUS and OUTRO sections lean on the bank, INTRO can't (there
+is nothing to remember yet). The report names every quote:
+`motifs  bank of 3 captured; OUTRO: T+7+inv@m0, aug2.0@m2`.
+
+Quotes are protected processes like tape loops (nothing culls or transposes
+a quotation mid-cell; cost routing moves one atomically), and the tape
+machinery prefers remembered material: about half of tape loops build their
+cell from a motif, and quotes themselves can be echo-decorated — the
+opening phrase may return as a phasing loop or a klangfarben cascade. All
+of it rides the replay token.
+
+## 1e. Harmonic fields — `--fields`
+
+Each section draws a **pitch-class field** — a 3–7-degree subset of the
+tuning, always anchored on the base degree — and every pitched emission in
+the section conforms to it: patterns, glide arrivals, bridges, echo
+cascades, tape-loop cells, motif quotes. Successive fields keep about half
+their tones, so sections move by voice-leading rather than teleportation.
+The report shows the harmony: `fields  INT: {0,2,5,7,9} | VER: {0,2,4,7,9}`.
+
+| flag | values | default | notes |
+|---|---|---|---|
+| `--fields 0\|1` | 0 or 1 | 1 | 0 disables snapping. Same replay token either way — the same composition, harmonically constrained or free. |
+
+Notes: motif quotes conform by design — contour and rhythm carry the
+memory, pitch content joins the present harmony (a verbatim quote against a
+changed field reads as a wrong note, not a memory). Sub-degree ornamental
+bends and p12 cents detune ride *above* the field: the field constrains the
+degree lattice, not the microtones. Notes spilling across a section
+boundary keep the field they were conceived in — suspensions, and audibly
+so.
+
+## 1f. Scale-tuned resonators (no flag — drawn)
+
+Two resonator effects join the drawn bus pool: **string resonators**
+(`streson` voices, room-class — one may lead the reverb chain) and a
+**modal bank** (four `mode` filters). Both are tuned at runtime to the
+current section's harmonic-field degrees via a score-written table, so the
+tank always rings on the harmony that is playing — send-heavy material
+excites sympathetic resonance on the same degrees the score-domain delays
+and field-conformant patterns are using, and the ringing *retunes at
+section boundaries* with a short portamento. Feedback is bounded at build
+time (0.92) and resonance gain is calibrated; there is nothing to blow up
+and nothing to set. Whether a piece draws them is part of the composition
+and rides the replay token.
 
 ## 2. Space and wet — `--space`, `--wetdry`, `--air`
 
@@ -207,7 +311,9 @@ default; −1 for something hotter; −12 if it will sit under other material.
 | `--draft` | 48 kHz / ksmps 16. Several times faster. Feedback-heavy timbres differ slightly from release: audition structure here, not final color. |
 | *(no flag)* | release: 96 kHz / ksmps 1, decimated to 48 kHz (needs numpy; without it the file stays at 96 kHz and the CLI says so). |
 | `--dry-run` | full report, no render. Free. Use it constantly. |
-| `--seed TAG` | filename/manifest tag ONLY. Does not reproduce anything. |
+| `--from MIN --to MIN` | audition a time window of the piece. The full piece is generated identically (same token, same routing, same levels) and only the window renders — minutes instead of hours. Notes sounding at the edge enter clipped; struck notes that have rung out are skipped; tails end at window + 12 s; the room active at the edge carries in. Window normalization is audition-only. |
+| `--replay TOKEN` | regenerate a previous piece from its manifest's replay token. Flags that feed generation (nodes, duration, sections, subset, tuning) must match the original; mix-side flags (`--wetdry`, `--space`, `--normalize`, draft/release) may differ — same composition, different mix. Version-specific: a token from another version warns and may not match. |
+| `--seed TAG` | filename/manifest tag ONLY. Does not reproduce anything (use `--replay`). |
 | `--out WAV` | output path. The manifest lands beside it as `.txt`. |
 | `--no-keep-csd` | delete the generated `.csd` after rendering. |
 | `--csound PATH` | point at the csound binary if it isn't on PATH. |
@@ -221,9 +327,25 @@ python3 -m orange_fur <flags> --draft --out try1.wav         # 2. listen
 python3 -m orange_fur <flags> --out keeper.wav               # 3. commit at release quality
 ```
 
-Because runs aren't reproducible, step 3 is a *new piece* in the same
-territory, not a re-render of the draft you liked. Render release keepers in
-small batches (2–3) and keep the best.
+Step 3 re-renders the draft you liked as the *same piece*: take the replay
+token from the draft's report (or its manifest) and pass it back:
+
+```
+python3 -m orange_fur <same flags> --draft --out try1.wav      # token printed
+python3 -m orange_fur <same flags> --replay 0.8.0:9f3a... --out keeper.wav
+```
+
+The generation flags must match the draft's; the mix flags (`--wetdry`,
+`--space`, `--normalize`) and draft/release may differ — that makes replay a
+remix knob: same composition, different room.
+
+For long pieces, add the window to the loop: spot-check a passage at release
+quality before committing hours to the whole —
+
+```
+python3 -m orange_fur --nodes 80 --duration 30 --replay TOKEN --from 12 --to 15 --out check.wav
+```
+
 
 ---
 

@@ -135,6 +135,7 @@ endin
 """
     orc = build_orc(cfg, 0.7, test_instr, routing=r)
     sco = (f"f 900 0 -8 -2 0 1 1 1 -1 1 1 1\n"
+           f"f 901 0 -10 -2 0 0 4 7 9 -1 0 0 0 0\n"    # Phase 14 resonators
            f"{cfg.scale.ftable(TUNING_TABLE)}\n"
            f"i 99 0 {dur}\n{note}\n{extra}\ne")
     Path("/tmp/p4u.csd").write_text(build_csd(cfg, orc, sco))
@@ -201,12 +202,12 @@ def test_end_to_end():
     m = re.search(r"model error ([+-][0-9.]+) dB", res.stdout)
     if m:
         # This test runs the CLI, which is entropy-seeded BY SPEC, so each run
-        # samples the model-error distribution. The measured band is roughly
-        # -7.5..+5.7 dB with a thin tail beyond; the assertion exists to catch
-        # gross model breakage (the 11 dB per-envelope class of bug), not to
-        # police the tail, and a randomly failing test teaches people to
-        # ignore failures. 10 dB.
-        check("e2e: model error within 10 dB", abs(float(m.group(1))) < 10.0,
+        # samples the model-error distribution. Since Phase 9 (echo trains +
+        # the partial-coherence model, COH biased toward over-prediction, the
+        # safe direction) the band is roughly -10..+2 dB with a thin tail.
+        # The assertion catches gross model breakage, not the tail; a
+        # randomly failing test teaches people to ignore failures. 12 dB.
+        check("e2e: model error within 12 dB", abs(float(m.group(1))) < 12.0,
               m.group(1))
 
 

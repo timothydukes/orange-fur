@@ -160,11 +160,21 @@ instr {num}
   icps  =  icps < 8 ? 8 : icps
   igl   =  p10                       ; glide target, offset in scale degrees
   icur  =  p11                       ; transeg curve (0 = linear)
-  icps2 =  cpstuni(p4 + igl, giTun)
+  ; PHASE 9 -- p12 is DETUNE IN CENTS, the first officially off-scale pitch in
+  ; the system. idetr multiplies the tuning lookup, and kgl is computed
+  ; against the RAW lookup (icps0) so it carries BOTH glide and detune: every
+  ; baked-partial template (banks, tuned clouds, mode banks) rides p12 the
+  ; same way it rides p10 -- the whole spectrum detunes rigidly. p12 = 0 gives
+  ; idetr = 1 and pre-Phase-9 behaviour exactly.
+  idetr =  2 ^ (p12 / 1200)
+  icps0 =  icps
+  icps  =  icps * idetr
+  icps  =  icps > sr / 2.2 ? sr / 2.2 : icps
+  icps2 =  cpstuni(p4 + igl, giTun) * idetr
   icps2 =  icps2 > sr / 2.2 ? sr / 2.2 : icps2
   icps2 =  icps2 < 8 ? 8 : icps2
   kcps  transeg  icps, p3, icur, icps2
-  kgl   =  kcps / icps
+  kgl   =  kcps / icps0
   iamp  =  p5
   ipan  =  p6
   isend =  p7

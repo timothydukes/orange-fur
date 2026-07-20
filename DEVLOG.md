@@ -477,6 +477,184 @@ Listen with the printout in hand: the `gestures` line is the piece's
 sequence of glissandi, diverging clouds, sweeps, loops and long decays, and the
 `macro` line is the slow clock they run on.
 
+## 10a. Phase 7 — replay (v0.8.0)
+
+One 64-bit seed, drawn from OS entropy at startup, now governs every draw in
+a run and is printed in the report/manifest as `VERSION:HEX` — the replay
+token. `--replay TOKEN` injects it and regenerates the identical piece
+(csd-identical, verified in test_p7); a token from a different version warns,
+since any change to RNG draw order changes what a seed means. The default
+filename tag now derives from the seed, making the seed the program's only
+entropy source. `--seed` remains a pure label. Consequences: draft→release
+renders the *same piece*, manifests are recipes rather than descriptions, and
+mix-side flags become remix knobs over a fixed composition. Every phase from
+here inherits RNG stream discipline: new draws are appended at defined points
+and documented per phase.
+
+## 10b. Phase 8 — time window (v0.9.0)
+
+`--from MIN --to MIN` renders a window of the piece. The full piece is
+generated first — identical RNG stream, cost routing, and amp gains — and the
+window is a post-generation transform, so a `--replay` token windows the
+composition it names (slice parity is tested: every interior note appears
+shifted with identical p-fields). Edge policy: notes sounding at `from` enter
+with start clamped and remainder duration; struck notes whose attack lies
+more than 3·tau before the edge have rung out and are skipped; all tails end
+at window + 12 s, inheriting the full-piece bus-close contract (the first
+implementation let a 40-second tail keep the performance alive past the
+closed bus — half a minute of rendered silence on every audition). The room
+active at the edge carries in as the t=0 room. Levels come from the
+full-piece model; post-render normalization still applies but is labeled
+audition-only. Long-form workflow: spot-check minute 12–15 at release
+quality without rendering the other 27.
+
+## 10h. Phase 14 — scale-tuned resonators (v0.15.0)
+
+The arc's final phase, and its compound payoff: effect units that ring on
+the harmony. Two new pool units — `streson` string resonators (2–3 voices,
+room-class, may lead the reverb chain) and a 4-voice `mode` bank — tuned at
+runtime from `f 901`, a score-written table of each section's field degrees
+(the exact `f 900` rooms mechanism: k-rate row scan by time, per-unit
+cursor, `cpstun` into the tuning table, portamento on retune). Routing is
+drawn before the score exists; the table indirection is what lets a
+pre-drawn chain ring on fields that haven't been drawn yet.
+
+Phase 3's lessons applied at construction, and verified in audio: feedback
+railed at 0.92 across all draws with a worst-case 14 s decay test (no
+runaway); `mode`'s resonance gain scales with Q, so makeup is 1/(2Q) per
+voice (the 1/√Q seed left +5 dB at Q 150 in the click test); classic
+(1−fb)/n makeup on streson; dcblock + 45 Hz highpass hygiene. The click
+test pins the ring to a tuned field degree (or harmonic) within 1%, and the
+retune test proves the ring MOVES at a section boundary and lands on the
+new field. One found-and-fixed: `portk`'s state initializes at zero, so
+every resonator glided up from silence for its first seconds — the
+half-time now ramps from 0 (instant tracking at init) to its drawn value.
+The windowed-render path trims `f 901` with the same helper as the room
+table. New table in every csd; no flags; presence rides the replay token.
+
+## 10g. Phase 13 — harmonic fields (v0.14.0)
+
+Sections acquire harmonic identity: a per-section pitch-class field (3–7
+degrees, anchored on 0, chained so ~half the tones carry over — voice-
+leading, not teleportation), enforced by ONE composed snap(fold(i)) applied
+at every pitched emission site. Enumerating those sites was the phase's real
+work: patterns, budget top-ups, the guaranteed SWELL carrier, gap bridges
+(snapped by the field active at their own start, not the last drawn one —
+the closure would otherwise leak the final section's field), glide
+arrivals, echo cascades, tape-loop cells, motif quotes. Two findings: (1)
+echo trains inherited glide offsets relative to their SOURCE index, so a
+degree-cascade echo's arrival left the field until the offset was re-derived
+through the fold; (2) notes spilling across a section boundary conform to
+the field that EMITTED them — suspensions, documented as semantics rather
+than patched as leaks (a few per cent of events at boundaries; the tests
+assert union-membership always and ≥95%% wall-clock conformance).
+
+Interpretive decision, flagged at the gate: motif quotes and loop cells
+CONFORM — contour and rhythm carry the memory, pitch content joins the
+present harmony. The opposite policy (quotation fidelity) is one line.
+Sub-degree ornamental bends and p12 cents ride above the field: the field
+constrains the degree lattice, not the microtones. `--fields 0/1` share a
+replay token — snapping consumes no draws.
+
+## 10f. Phase 12 — motif recurrence (v0.13.0)
+
+The system has always morphed forward without looking back; now a piece has
+a MEMORY. Capture is deterministic — the first MAX_BANK (4) qualifying
+phrases become the bank, consuming zero RNG draws, so replay stability holds
+by construction: what the piece remembers is what it said first. Quotation
+is L1-driven (CHORUS and OUTRO quote most; INTRO structurally cannot) with a
+fixed draw count per section; transforms are transpose / invert (around the
+first degree) / retrograde (pitches AND rhythm) / augment (rhythm and
+durations together), and every quote is named in the report
+(`T+7+inv@m0`). Quotes inherit the Phase 10 protected-process rule exactly
+as planned — echo = −3, proc id, atomic cost routing, cull/register bypass,
+accent applies.
+
+The promised coupling lands: about half of tape loops build their cell from
+a motif (rhythm compressed into the loop period), and quotes pass through
+the ordinary echo-decoration draw — so the tape machinery stops processing
+arbitrary material and starts processing the piece's own past. A remembered
+phrase can return as a phasing loop, a klangfarben cascade, or a
+cents-drifted train.
+
+## 10e. Phase 11 — rotating-timbre delay (v0.12.0)
+
+Tape-music arc C, built on the Phase 9 emitter. About 35%% of sections draw a
+ROTATION: each echo generation k sounds on instrument cycle[(k−1) mod len] of
+a drawn 2–4-voice cycle — klangfarben echo, the clearest case where the
+score-domain delay beats the audio-domain one, since no audio delay can
+rotate through an orchestra. The cycle is drawn per category, up-front, with
+a fixed draw count whatever the pools contain (stream discipline, tested by
+comparing RNG state across full and empty pools), and only ever from the
+source's own category — the contract is now category-level: an echo never
+leaves its source's category but need not keep its instrument (test_p9
+amended accordingly). Amplitudes are INSTR_PEAK-compensated (clamped 0.25–4)
+so the heard decay follows the feedback curve while the calibration spread
+of the rotating instruments cancels; pitch and rhythm stay strict while
+color cycles, which is what keeps the echo an echo. Decay-time gestures
+(up / down / arch / flat, drawn) scale each pattern's repeat count by
+section-relative time: tails lengthen toward a climax or shorten as a
+phrase dries out. No new flags; both properties ride the replay token.
+
+## 10d. Phase 10 — tape loops (v0.11.0)
+
+Tape-music arc B: looping tape delay with phase drift, 100%% in the score.
+Per section (drawn unconditionally, emitted at gong-class rarity) two or
+three loop voices repeat a 2–5-note cell at periods T and T(1+ε): the
+accumulating offset is the phasing mechanism — microtiming as a first-class
+score dimension — and the realignment time T/ε is computed at generation and
+printed in the report, the piece's formal event predicted in text. The first
+eps draw was blind (0.2–2%%) and every realignment landed minutes past the
+loop's end; ε is now drawn against the section — 65%% of draws pick the
+realignment time directly (0.55–0.95 of the loop's run, so the canon
+completes inside it), 35%% keep the slow-smear band where drift is felt, not
+resolved.
+
+**The protected-process rule** (established here; motif recurrence inherits
+it): a phasing loop reads only if its cell is perceptually identical every
+pass, so loop notes bypass the macro density cull and the register
+staircase, are excluded from echo decoration, and carry a process id that
+**cost routing honors atomically** — all of a loop's notes rebind to the
+same instrument together or not at all. The accent contour still applies:
+macro-dynamics sequencing a loop's loudness is musical; dynamics don't
+threaten identity. Loop notes are marked echo = −2 (outside the N² source
+budget, like decoration); cells never draw GONG (the gongs-rare contract
+outranks the loop). No flag: loops are composition, not mix, and ride the
+replay token.
+
+## 10c. Phase 9 — score-domain delay + p12 (v0.10.0)
+
+The tape-music arc begins. **p12 = detune in cents** enters the p-field
+contract — the first officially off-scale pitch. It multiplies the tuning
+lookup, and `kgl` is computed against the raw lookup so baked-partial
+templates (banks, tuned clouds, mode banks) ride detune rigidly, exactly as
+they ride glide; measured in rendered audio at ratio 1.0595 for +100 c on
+sine, PWM, and bank templates alike. p12 = 0 is bit-identical to Phase 8.
+
+**echoes.py**: a delay line made of score. Per section a treatment is drawn —
+plain repeat, degree cascade (steps in *scale degrees*, folded), octave
+spiral, or cents drift (a feedback path that is a microscopic transposer) —
+with delay 100–1000 ms and feedback 0.4–0.8, and a drawn fraction of phrases
+spawn decaying trains: the delay processes phrases, not samples, and every
+echo is a note the whole system can see.
+
+**A design fork, resolved for replay.** Counting echoes against the N²
+budget ("more repetitive, not bigger") made `--echo` a generation parameter —
+changing it changed the source composition, and a replay token no longer
+named one piece. The remix-knob property won: the budget governs source
+notes, echoes are decoration on top, and `--echo 0/1/2` provably leaves the
+source composition untouched (tested at the Event level; bridges and cost
+routing legitimately adapt). Echo draws are made unconditionally so the RNG
+stream is identical whether or not trains are emitted.
+
+**The amp model met coherence for real this time.** Same-pitch echoes of
+tonal notes put partials at identical frequencies; the incoherent model
+under-predicted echoed pieces by ~8 dB, the full amplitude-sum bound
+over-predicted by as much (183.1 cycles of delay is not phase alignment).
+The model now sums tonal notes sharing (instr, pitch, detune) as
+COH·(amp sum)² + (1−COH)·(power sum), COH = 0.6, deliberately biased toward
+over-prediction — the safe direction, since normalization is exact.
+
 ## 10. Phase 6 — integration: long form, release master, final surface
 
 **Two render modes, and that is the whole surface now:**

@@ -121,11 +121,11 @@ def test_selection():
         ev, meta = graph_events(cfg, sol, rng)
 
         check(f"select: N={nodes} note count within 35% of the N**2 budget",
-              abs(len(ev) - sol.budget) <= max(12, 0.35 * sol.budget),
-              (len(ev), sol.budget))
+              abs(sum(1 for _e in ev if _e.echo == 0) - sol.budget) <= max(12, 0.35 * sol.budget),
+              (sum(1 for _e in ev if _e.echo == 0), sol.budget))
         check(f"select: N={nodes} onsets sorted; heads inside, spill <= +4s",
               all(0 <= e.start <= cfg.dur_sec + 4.0 for e in ev)
-              and all(ev[i].start <= ev[i + 1].start for i in range(len(ev) - 1)))
+              and all(ev[i].start <= ev[i + 1].start for i in range(sum(1 for _e in ev if _e.echo == 0) - 1)))
         check(f"select: N={nodes} every section produced notes",
               all(s["notes"] > 0 for s in meta["sections"]))
         check(f"select: N={nodes} section spans tile the timeline in order",

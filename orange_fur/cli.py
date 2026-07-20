@@ -18,6 +18,7 @@ from .config import (
 )
 from .orc import build_orc, build_csd
 from .score import (graph_events, compensate, build_sco, set_instr_peaks,
+                    apply_window,
                     cost_route)
 from .orchestra import generate as gen_orchestra
 from .constraints import solve
@@ -50,6 +51,17 @@ def build_parser() -> argparse.ArgumentParser:
                    dest="cost_cap",
                    help="render-cost cap in oscili-seconds; 0 = auto "
                         "(1200 x duration), negative = disable routing")
+    p.add_argument("--echo", type=_ranged(0.0, 3.0), default=1.0,
+                   metavar="SCALE",
+                   help="score-domain delay density: scales each section's "
+                        "drawn echo probability (0 disables; the piece is "
+                        "otherwise identical -- same replay token)")
+    p.add_argument("--fields", type=_ranged(0, 1, int), default=1,
+                   metavar="0|1",
+                   help="harmonic fields: each section draws a pitch-class "
+                        "subset all pitched material conforms to (1, "
+                        "default). 0 disables snapping; same replay token, "
+                        "harmonically free")
     p.add_argument("--sections", type=_ranged(0, 64, int), default=0,
                    metavar="K",
                    help="how many sections the L1 grammar emits; "
@@ -79,6 +91,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--draft", action="store_true",
                    help="fast iteration render: 48 kHz, ksmps=16. Changes the "
                         "sound of any sample-rate-sensitive chain.")
+    p.add_argument("--from", dest="win_from", type=float, default=None,
+                   metavar="MIN",
+                   help="audition window start (minutes into the piece); the "
+                        "full piece is generated identically and this window "
+                        "of it is rendered")
+    p.add_argument("--to", dest="win_to", type=float, default=None,
+                   metavar="MIN",
+                   help="audition window end (minutes); requires --from")
+    p.add_argument("--replay", type=str, default=None, metavar="TOKEN",
+                   help="replay token from a previous run's report "
+                        "(VERSION:HEX, or bare hex); regenerates that piece "
+                        "exactly if the code version matches")
     p.add_argument("--seed", default="", metavar="TAG",
                    help="filename tag only; does NOT make the run reproducible")
     p.add_argument("--out", type=Path, default=None, metavar="WAV",
@@ -107,16 +131,45 @@ def print(*args, **kw):        # noqa: A001 -- deliberate module-local shadow
     _print(*args, **kw)
 
 
+def _parse_replay(token: str) -> tuple[int, str | None]:
+    """Replay token -> (seed, version-or-None). Accepts 'VERSION:HEX16' as
+    printed in the report, or a bare hex seed."""
+    ver = None
+    if ":" in token:
+        ver, token = token.rsplit(":", 1)
+    try:
+        seed = int(token, 16)
+    except ValueError:
+        raise SystemExit(f"orange-fur: bad --replay token {token!r} "
+                         "(expected VERSION:HEX or hex)")
+    if not (0 <= seed < 1 << 64):
+        raise SystemExit("orange-fur: --replay seed out of 64-bit range")
+    return seed, ver
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+
+    replay_seed, replay_ver = (None, None)
+    if args.replay is not None:
+        replay_seed, replay_ver = _parse_replay(args.replay)
+
+    win = None
+    if (args.win_from is None) != (args.win_to is None):
+        raise SystemExit("orange-fur: --from and --to must be given together")
+    if args.win_from is not None:
+        if not (0 <= args.win_from < args.win_to <= args.duration):
+            raise SystemExit("orange-fur: need 0 <= --from < --to <= --duration")
+        win = (args.win_from * 60.0, args.win_to * 60.0)
 
     kw = dict(
         duration=args.duration, nodes=args.nodes, space=args.space,
         air=args.air, wetdry=args.wetdry, subset=args.subset,
         normalize=args.normalize, draft=args.draft, seed=args.seed,
-        sections=args.sections, cost_cap=args.cost_cap,
+        sections=args.sections, cost_cap=args.cost_cap, echo=args.echo,
+        fields=args.fields,
         scl=args.scl, out=args.out, keep_csd=args.keep_csd,
-        csound=args.csound,
+        csound=args.csound, replay=replay_seed,
     )
     if args.basefreq is not None:
         kw["basefreq"] = args.basefreq
@@ -125,9 +178,16 @@ def main(argv: list[str] | None = None) -> int:
 
     cfg = Config(**kw)
     print(cfg.summary())
+    print(f"  replay     {__version__}:{cfg.entropy:016x}"
+          + ("" if args.replay is not None else
+             "   (pass to --replay to regenerate this piece)"))
+    if replay_ver is not None and replay_ver != __version__:
+        print(f"  WARNING    replay token is from v{replay_ver}, this is "
+              f"v{__version__}: the RNG stream may have changed and the "
+              f"regenerated piece may not match the original")
     print()
 
-    # Non-deterministic by spec: the RNG is seeded from OS entropy regardless
+    # Phase 7: --replay overrides the entropy draw; otherwise unchanged spec
     # of --seed.
     rng = random.Random(cfg.entropy)
 
@@ -171,8 +231,26 @@ def main(argv: list[str] | None = None) -> int:
         cap = 0.0
     croute = cost_route(events, cfg, orch, cap)
 
+    # amp gains from the FULL piece -- the window sounds as this passage will
+    # sound in the keeper render, not as a re-levelled excerpt
     stats = compensate(events, cfg, routing=routing)
     stats["rooms"] = smeta["rooms"]
+    stats["sec_fields"] = smeta["sec_fields"]
+
+    score_dur = None
+    if win is not None:
+        events, wrooms, wrep = apply_window(events, smeta["rooms"],
+                                            win[0], win[1])
+        stats["rooms"] = wrooms
+        from .score import trim_timed
+        stats["sec_fields"] = trim_timed(stats.get("sec_fields", []),
+                                         win[0], win[1])
+        score_dur = win[1] - win[0]
+        print(f"  window     {win[0]/60:g}-{win[1]/60:g} min of the piece: "
+              f"{wrep['kept']} notes ({wrep['clipped']} clipped at the edge, "
+              f"{wrep['rung_out']} struck notes already rung out)")
+        print( "             note: post-render normalization is AUDITION-ONLY"
+              " here; the full piece normalizes on its own global peak")
 
     mac = smeta["macro"]
     if mac:
@@ -180,6 +258,24 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  macro      accent {m0['accent']}  gesture {m0['gesture']}  "
               f"density {m0['density']}  register {m0['register']}  "
               f"(periods {m0['periods']} s)")
+        print("  echoes     " + " | ".join(
+            f"{m['section'][:3]}: {m['echo']}" for m in mac))
+        totech = sum(sl.get("echo_notes", 0) for sl in smeta["sections"])
+        if totech:
+            print(f"             {totech} echo notes "
+                  f"({totech / max(1, len(events)):.0%} of the score)")
+        if getattr(cfg, "fields", 1):
+            print("  fields     " + " | ".join(
+                f"{m['section'][:3]}: {m.get('field', '?')}" for m in mac))
+        bank = max((m.get("bank", 0) for m in mac), default=0)
+        qlines = [(m["section"], m["quotes"]) for m in mac if m.get("quotes")]
+        if bank:
+            print(f"  motifs     bank of {bank} captured; " + (" | ".join(
+                f"{sn}: {', '.join(qs)}" for sn, qs in qlines)
+                if qlines else "no quotes drawn"))
+        loops = [(m["section"], m["loop"]) for m in mac if m.get("loop")]
+        for sname, ldesc in loops:
+            print(f"  tape loop  [{sname}] {ldesc}")
         print("  gestures   " + " | ".join(
             f"{m['section'][:3]}: {'>'.join(g.lower() for g in m['playlist'])}"
             for m in mac))
@@ -217,7 +313,7 @@ def main(argv: list[str] | None = None) -> int:
               f"note-start gaps > max(8 s, 5% of the piece)")
 
     orc_text = build_orc(cfg, stats["ceiling"], orch.text(), routing=routing)
-    sco_text = build_sco(cfg, events, stats)
+    sco_text = build_sco(cfg, events, stats, score_dur=score_dur)
     csd_text = build_csd(cfg, orc_text, sco_text)
     csd_path = R.write_csd(cfg, csd_text)
 

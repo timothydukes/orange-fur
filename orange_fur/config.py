@@ -8,7 +8,6 @@ this and nothing else, so a run is fully described by one struct.
 from __future__ import annotations
 
 import os
-import secrets
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -43,6 +42,8 @@ class Config:
     subset: float = 50.0           # 10..100 percent of the generated orchestra used
     sections: int = 0              # L1 section count; 0 = auto (drawn from duration)
     cost_cap: float = 0.0          # oscili-seconds; 0 = auto (1200 * duration)
+    echo: float = 1.0              # Phase 9: echo probability scale; 0 = off
+    fields: int = 1                # Phase 13: harmonic-field snapping; 0 = off
     normalize: float = -3.0        # target peak ceiling, dBFS (see note in score.py)
     draft: bool = False
     seed: str = ""                 # FILENAME TAG ONLY -- does not constrain the RNG
@@ -52,6 +53,7 @@ class Config:
     out: Path | None = None
     keep_csd: bool = True
     csound: str = "csound"
+    replay: int | None = None      # Phase 7: inject a prior run's entropy
 
     # derived
     scale: Scale = field(init=False)
@@ -63,9 +65,17 @@ class Config:
         # INTERPRETIVE DECISION: `seed` is a label, not a seed. Per spec the
         # program is non-deterministic; generators always draw from OS entropy.
         # If the user supplies --seed it is used ONLY in the output filename.
-        self.entropy = int.from_bytes(os.urandom(8), "big")
+        # PHASE 7: --replay injects a previous run's 64-bit entropy and
+        # regenerates that piece exactly (same code version required -- any
+        # change to the RNG draw order changes what a seed means). The value
+        # is printed in the report/manifest as version:hex, the replay token.
+        self.entropy = (self.replay if self.replay is not None
+                        else int.from_bytes(os.urandom(8), "big"))
         if not self.seed:
-            self.seed = secrets.token_hex(4)
+            # the default tag derives from the entropy: a replayed piece gets
+            # the same default filename family, and the run's one 64-bit seed
+            # is the program's ONLY entropy source
+            self.seed = f"{self.entropy:016x}"[:8]
 
         if self.out is None:
             self.out = Path(f"orange_fur_{self.seed}.wav")

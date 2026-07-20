@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import math
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from .config import Config
 from .orc import TUNING_TABLE
@@ -34,6 +34,11 @@ class Event:
     wave: int = 0
     glide: float = 0.0   # p10: target offset in scale degrees (0 = no glide)
     gcurve: float = 0.0  # p11: transeg curve
+    det: float = 0.0     # p12: detune in cents (Phase 9; 0 = on the scale)
+    echo: int = 0        # echo generation: 0 source, k>0 = k-th echo,
+                         # -1 = gap-bridge swell, -2 = protected loop process
+    proc: int = 0        # Phase 10: protected-process id (0 = none); cost
+                         # routing moves a process ATOMICALLY
 
 
 # ---------------------------------------------------------------------------
@@ -228,6 +233,16 @@ def cost_route(events: list[Event], cfg: Config, orch, cap: float) -> dict:
         b = max(0, min(int(e.start * GRID_HZ), nbins - 1))
         return counts[b]
 
+    # Phase 10: PROTECTED PROCESSES rebind atomically. A tape loop's identity
+    # is its unvarying cell; splitting its voices across instruments destroys
+    # the phasing percept. All notes sharing a proc id move together to the
+    # same target, or not at all.
+    procs: dict[int, list[Event]] = {}
+    for e in events:
+        if e.proc:
+            procs.setdefault(e.proc, []).append(e)
+    done_procs: set[int] = set()
+
     order = sorted(range(len(events)), key=lambda i: -density(events[i]))
     cur = before
     rerouted = 0
@@ -241,6 +256,17 @@ def cost_route(events: list[Event], cfg: Config, orch, cap: float) -> dict:
         old = costs.get(e.instr, 1.0)
         new = costs.get(tgt, 1.0)
         if new >= old:
+            continue
+        if e.proc:
+            if e.proc in done_procs:
+                continue
+            done_procs.add(e.proc)
+            for pe in procs[e.proc]:
+                d_old = costs.get(pe.instr, 1.0)
+                if d_old > new:
+                    cur -= (d_old - new) * pe.dur
+                    pe.instr = tgt
+                    rerouted += 1
             continue
         cur -= (old - new) * e.dur
         e.instr = tgt
@@ -419,9 +445,26 @@ def fold_index(index: int, basekey: int, grades: int) -> int:
     return basekey + (folded if rel >= 0 else -folded)
 
 
+# Tonal categories: deterministic oscillators on scale degrees. Two notes of
+# the SAME instrument at the SAME pitch (the defining case: a plain echo train
+# overlapping its source) put partials at identical frequencies, and the
+# worst-case peak of same-frequency partials is the AMPLITUDE sum, not the
+# power sum. Phase 9's echo trains made this structural instead of
+# incidental, and the incoherent model under-predicted echoed pieces by
+# ~8 dB; the pure amplitude-sum bound then OVER-predicted by as much (real
+# phases are mostly unaligned -- a 700 ms delay at 261 Hz is 183.1 cycles).
+# Model: within a bin, notes sharing (instr, index, detune) form a GROUP,
+# and the group's power is COH * (amplitude sum)^2 + (1-COH) * (power sum) --
+# a partial-coherence interpolation, calibrated against rendered pieces.
+TONAL = {int(Cat.PARTIAL), int(Cat.TCLOUD), int(Cat.SWELL)}
+COH = 0.6
+
+
 def _chain_power(events, cfg, nbins, chan: int, leg: str) -> list[float]:
-    """Windowed power envelope for one channel of one leg (dry or send)."""
+    """Windowed power envelope for one channel of one leg (dry or send),
+    with coherent within-group summation for tonal categories."""
     env = [0.0] * nbins
+    coh: list[dict | None] = [None] * nbins
     wincache: dict[tuple, list[float]] = {}
     for e in events:
         a = max(0, min(int(e.start * GRID_HZ), nbins - 1))
@@ -443,8 +486,22 @@ def _chain_power(events, cfg, nbins, chan: int, leg: str) -> list[float]:
                  else _beta_window(round(e.slew, 2), n))
             if len(wincache) < 8192:
                 wincache[key] = w
-        for i in range(n):
-            env[a + i] += p * w[i] * w[i]
+        if e.cat in TONAL:
+            g = (e.instr, e.index, round(e.det, 1))
+            for i in range(n):
+                d = coh[a + i]
+                if d is None:
+                    d = coh[a + i] = {}
+                lin, pw = d.get(g, (0.0, 0.0))
+                d[g] = (lin + amp * w[i], pw + p * w[i] * w[i])
+        else:
+            for i in range(n):
+                env[a + i] += p * w[i] * w[i]
+    for i in range(nbins):
+        d = coh[i]
+        if d:
+            env[i] += sum(COH * lin * lin + (1.0 - COH) * pw
+                          for lin, pw in d.values())
     return env
 
 
@@ -491,6 +548,10 @@ def graph_events(cfg, sol, rng: random.Random,
     from . import phenotype as P
     from . import layers as L
     from . import macro as M
+    from . import echoes as E
+    from . import tapeloops as TL
+    from . import motifs as MO
+    from . import fields as FI
 
     sysm = sol.system
     n = sysm.n
@@ -511,6 +572,10 @@ def graph_events(cfg, sol, rng: random.Random,
     T = len(terms)
 
     events: list[Event] = []
+    proc_counter = 0
+    motif_bank: list[MO.Motif] = []
+    field = None          # Phase 13: chained per-section harmonic field
+    sec_fields = []       # (t0, field) in time order, for post-loop snapping
     cursor = 0
     seclog = []
     macro_log = []
@@ -551,8 +616,129 @@ def graph_events(cfg, sol, rng: random.Random,
         # section. It does not replace the layers; it decides which of their
         # decisions is currently in force.
         plan = M.draw_plan(rng, t0, span)
+
+        # PHASE 9: the section's score-domain delay. Drawn even when echoing
+        # is disabled (--echo 0) so the RNG stream -- and therefore every
+        # replay token -- is identical whether or not echoes render.
+        eplan = E.draw_plan(rng, cfg.scale.numgrades)
+        # Phase 11: rotation cycles drawn up-front per category -- a fixed
+        # draw count regardless of what the section emits (stream discipline)
+        ecycles = (E.draw_cycles(rng, eplan, catmap)
+                   if catmap is not None else {})
+        # PHASE 13: the section's harmonic field, chained from the previous
+        # (about half the tones carry over -- voice-leading, not
+        # teleportation). Drawn unconditionally; snapping costs no draws, so
+        # --fields 0/1 share a replay token.
+        field = FI.draw_field(rng, cfg.scale.numgrades, field)
+        sec_fields.append((t0, field))
+        if cfg.fields:
+            ffold = lambda i: field.snap(
+                fold_index(i, cfg.scale.basekey, cfg.scale.numgrades),
+                cfg.scale.basekey)
+        else:
+            ffold = lambda i: fold_index(i, cfg.scale.basekey,
+                                         cfg.scale.numgrades)
+
+        echo_notes_sec = 0
+
+        # PHASE 10: the section's tape-loop draw -- unconditional (stream
+        # discipline), gong-class rare in effect. See tapeloops.py for the
+        # protected-process rule established here.
+        lplan = TL.draw_plan(rng, span)
+        # PHASE 12 coupling: half the time a loop prefers REMEMBERED material
+        # -- its cell is a motif, rhythm compressed into the loop period.
+        # Both draws unconditional (stream discipline).
+        m_use, m_which = rng.random(), rng.random()
+        if motif_bank and m_use < 0.5:
+            mot = motif_bank[int(m_which * len(motif_bank)) % len(motif_bank)]
+            tot = sum(mot.iois) or 1.0
+            offs, acc = [0.0], 0.0
+            for i in mot.iois:
+                acc += i
+                offs.append(acc / tot * lplan.period * 0.92)
+            lplan.cell = [TL.CellNote(
+                off=o, dur=max(0.06, min(0.6, d * 0.4)),
+                degree=dg, amp=0.5 + 0.5 * (j == 0))
+                for j, (o, dg, d) in enumerate(zip(offs, mot.degrees,
+                                                   mot.durs))]
+            lplan.cat = TL.LOOP_CATS[[int(c) for c in TL.LOOP_CATS]
+                                     .index(mot.cat)]                 if mot.cat in [int(c) for c in TL.LOOP_CATS] else lplan.cat
+        loop_draw = rng.random()
+        loop_here = loop_draw < lplan.prob
+        loop_notes_sec = 0
+        if loop_here and catmap is not None:
+            pool = catmap.get(lplan.cat) or []
+            if pool:
+                proc_counter += 1
+                li = pool[int(rng.random() * len(pool)) % len(pool)]
+                lsend = rng.uniform(0.25, 0.55)
+                lbase = cfg.scale.basekey + rng.choice([-12, -7, 0, 0, 5])
+                fold = ffold
+                lnotes = TL.emit(lplan, t0, span, lbase, li, lsend,
+                                 plan.gain_at, fold, proc_counter,
+                                 cfg.dur_sec + 12.0)
+                events.extend(lnotes)
+                loop_notes_sec = len(lnotes)
+        # PHASE 12: motif quotes. Count and transforms drawn with a fixed
+        # number of draws per section; emission draws (time, voice, amp,
+        # send, echo gate) are consumed for BOTH slots unconditionally.
+        quotes = MO.draw_quotes(rng, sec.name, len(motif_bank))
+        slot_draws = [(rng.uniform(0.05, 0.8), rng.random(),
+                       rng.uniform(0.25, 0.5), rng.uniform(0.3, 0.6),
+                       rng.random()) for _ in range(2)]
+        quote_tags = []
+        for qi, q in enumerate(quotes):
+            u_q, r_i, q_amp, q_send, e_gate = slot_draws[qi]
+            mot = motif_bank[q.motif]
+            pool = (catmap.get(mot.cat) or []) if catmap is not None else []
+            if not pool:
+                continue
+            degs, onsets, durs = MO.realize(q, mot)
+            proc_counter += 1
+            fold = ffold
+            qstart = t0 + u_q * span
+            qi_instr = pool[int(r_i * len(pool)) % len(pool)]
+            qnotes = []
+            for dg, on, du in zip(degs, onsets, durs):
+                st = qstart + on
+                if st > cfg.dur_sec + 4.0:
+                    continue
+                qnotes.append(Event(
+                    instr=qi_instr, start=st,
+                    dur=min(max(0.02, du), cfg.dur_sec + 12.0 - st),
+                    index=fold(cfg.scale.basekey + dg),
+                    amp=q_amp * plan.gain_at(st), pan=(0.3, 0.7)[qi % 2],
+                    send=q_send, slew=0.25, cat=mot.cat, wave=0,
+                    echo=-3, proc=proc_counter,
+                ))
+            if not qnotes:
+                continue
+            events.extend(qnotes)
+            quote_tags.append(f"{q.tag()}@m{q.motif}")
+            # a quote may itself be echo-decorated: the tape machinery
+            # processing the piece's own remembered material
+            if e_gate < eplan.prob * cfg.echo:
+                u_rel = (qnotes[0].start - t0) / max(1e-9, span)
+                etrain = E.echo_pattern(qnotes, eplan, fold,
+                                        cycles=ecycles, peaks=INSTR_PEAK,
+                                        u=min(1.0, max(0.0, u_rel)))
+                for t_ in etrain:
+                    if t_.start > cfg.dur_sec + 4.0:
+                        continue
+                    t_.dur = min(t_.dur, cfg.dur_sec + 12.0 - t_.start)
+                    t_.proc = 0            # echoes of a quote are decoration
+                    events.append(t_)
+                    echo_notes_sec += 1
+
         macro_log.append({
             "section": sec.name, "t0": t0,
+            "echo": eplan.describe(),
+            "quotes": quote_tags,
+            "bank": len(motif_bank),
+            "field": field.describe(),
+            "loop": (lplan.describe(t0, span) if loop_here and loop_notes_sec
+                     else None),
+            "loop_notes": loop_notes_sec,
             "playlist": [g.name for g in plan.playlist],
             "accent": "".join(str(x) for x in plan.accent.accent_pat()),
             "gesture": "".join(str(x) for x in plan.gesture.pattern),
@@ -609,6 +795,7 @@ def graph_events(cfg, sol, rng: random.Random,
             kp = rng.randint(plo, phi)
             degs = L.pattern_degrees(l4, kp, rng)
             kp = len(degs)
+            pat_events = []
             # a gliding cloud glides ONE way: the direction is drawn per
             # pattern, not per grain (per grain would be a diverging cloud)
             common_dir = rng.choice([-1, 1])
@@ -704,15 +891,54 @@ def graph_events(cfg, sol, rng: random.Random,
                 # through several independent paths, and a note past 100 s is
                 # indistinguishable from its own reverb tail anyway
                 dur = min(dur, 100.0)
+                _idx = ffold(cfg.scale.basekey + base_deg + dg + reg)
+                # the glide TARGET conforms too: a slide that lands off the
+                # field would undo the section's harmony at every arrival.
+                # Sub-degree fractional glides are ornamental bends, not
+                # arrivals -- they keep their exact (possibly off-lattice)
+                # extent, consistent with p12 cents riding above the field.
+                _gl = (ffold(_idx + int(round(gl))) - _idx
+                       if abs(gl) >= 1.0 else gl)
                 events.append(Event(
                     instr=voice_i, start=nstart, dur=dur,
-                    index=fold_index(cfg.scale.basekey + base_deg + dg + reg,
-                                     cfg.scale.basekey, cfg.scale.numgrades),
+                    index=_idx,
                     amp=amp, pan=pan, send=send, slew=slew,
                     cat=int(cat), wave=int(term.wave) if term.wave is not None else 0,
-                    glide=gl, gcurve=gc,
+                    glide=_gl, gcurve=gc,
                 ))
                 notes_emitted += 1
+                pat_events.append(events[-1])
+
+            # ---- PHASE 9: echo the pattern as a unit ----------------------
+            # The delay processes PHRASES: with the section plan's drawn
+            # probability, this pattern's notes spawn a decaying train, every
+            # note under the same (delay, feedback, step). The draw happens
+            # UNCONDITIONALLY (stream discipline); the echo scale gates only
+            # whether the train is emitted. Echo notes do NOT touch
+            # notes_emitted: the N^2 budget governs SOURCE notes, so the
+            # source composition is identical at every --echo setting and a
+            # replay token names one piece (see echoes.py for the fork).
+            if pat_events:
+                MO.capture(motif_bank,
+                           [e.index for e in pat_events],
+                           [e.start for e in pat_events],
+                           [e.dur for e in pat_events],
+                           pat_events[0].cat, sec.name)
+            edraw = rng.random()
+            if pat_events and edraw < eplan.prob * cfg.echo:
+                fold = ffold
+                u_rel = (pat_events[0].start - t0) / max(1e-9, span)
+                train = E.echo_pattern(pat_events, eplan, fold,
+                                       cycles=ecycles, peaks=INSTR_PEAK,
+                                       u=min(1.0, max(0.0, u_rel)))
+                # echoes honour the piece-level contracts: starts within the
+                # +4 s spill window, everything ends before the bus closes
+                for t_ in train:
+                    if t_.start > cfg.dur_sec + 4.0:
+                        continue
+                    t_.dur = min(t_.dur, cfg.dur_sec + 12.0 - t_.start)
+                    events.append(t_)
+                    echo_notes_sec += 1
 
         # TOP-UP: pattern-size draws are variable, so a section can land well
         # under its note budget (measured: 37% under at N=10 in a bad draw).
@@ -740,7 +966,7 @@ def graph_events(cfg, sol, rng: random.Random,
                        * (0.55 + 0.65 * cfg.space))
             events.append(Event(
                 instr=vi, start=start, dur=dur,
-                index=cfg.scale.basekey + rd.degree,
+                index=ffold(cfg.scale.basekey + rd.degree),
                 amp=P.lerp(P.CAT_AMP[cat], rd.amp_bias), pan=rd.pan,
                 send=send, slew=P.lerp(P.CAT_SLEW[cat], rd.slew),
                 cat=int(cat), wave=int(term.wave) if term.wave is not None else 0,
@@ -749,7 +975,8 @@ def graph_events(cfg, sol, rng: random.Random,
 
         seclog.append({
             "section": sec.name, "nodes": (lo, hi), "t0": t0, "t1": t1,
-            "notes": notes_emitted, "patterns": k, "slice": len(chunk),
+            "notes": notes_emitted, "echo_notes": echo_notes_sec,
+            "patterns": k, "slice": len(chunk),
             "l0": int(l0), "room": room.l3.name,
         })
 
@@ -769,7 +996,7 @@ def graph_events(cfg, sol, rng: random.Random,
             swi = (catmap[Cat.SWELL][0] if catmap else CAT_TO_INSTR[Cat.SWELL])
             events.append(Event(
                 instr=swi, start=start, dur=dur,
-                index=cfg.scale.basekey - 7, amp=0.4, pan=0.5,
+                index=ffold(cfg.scale.basekey - 7), amp=0.4, pan=0.5,
                 send=min(1.0, 0.8 * (0.55 + 0.65 * cfg.space)),
                 slew=0.9, cat=int(Cat.SWELL), wave=0))
             big["carrier_injected"] = True
@@ -798,6 +1025,17 @@ def graph_events(cfg, sol, rng: random.Random,
             # bounded above: 3.3% of a 45-minute piece would allow 89 s of
             # dead air, which is not a hole, it is an ending. 20 s is the cap.
             gap_min = min(20.0, max(8.0, cfg.dur_sec * 0.033))
+
+            def _bridge_fold(bt, i):
+                f = fold_index(i, cfg.scale.basekey, cfg.scale.numgrades)
+                if not cfg.fields or not sec_fields:
+                    return f
+                active = sec_fields[0][1]
+                for (st_, fl_) in sec_fields:
+                    if st_ <= bt:
+                        active = fl_
+                return active.snap(f, cfg.scale.basekey)
+
             spans = []
             for e in sorted(events, key=lambda e: e.start):
                 tau = INSTR_TAU.get(e.instr)
@@ -814,10 +1052,13 @@ def graph_events(cfg, sol, rng: random.Random,
                 dur = (b - t0) + 0.5
                 events.append(Event(
                     instr=rng.choice(swells), start=t0, dur=dur,
-                    index=cfg.scale.basekey + rng.choice([-12, -5, 0]),
+                    # a bridge lies between sections; it conforms to the
+                    # field ACTIVE AT ITS OWN START, not the last drawn one
+                    index=_bridge_fold(t0, cfg.scale.basekey
+                                       + rng.choice([-12, -5, 0])),
                     amp=rng.uniform(0.08, 0.16), pan=rng.uniform(0.35, 0.65),
                     send=rng.uniform(0.5, 0.75), slew=rng.uniform(0.3, 0.6),
-                    cat=int(Cat.SWELL), wave=0,
+                    cat=int(Cat.SWELL), wave=0, echo=-1,
                 ))
                 bridges += 1
 
@@ -825,12 +1066,102 @@ def graph_events(cfg, sol, rng: random.Random,
                     "seq": [s.name for s in secs], "macro": macro_log,
                     "bridges": bridges,
                     "rooms": [(t, r.l3.name, r.fb_scale, r.cut_scale, r.width)
-                              for t, r in rooms]}
+                              for t, r in rooms],
+                    "sec_fields": [(t, sorted(f.pcs)) for t, f in sec_fields]}
 
 
 # ---------------------------------------------------------------------------
 # Emission
 # ---------------------------------------------------------------------------
+def apply_window(events: list[Event], rooms: list, from_s: float, to_s: float
+                 ) -> tuple[list[Event], list, dict]:
+    """Phase 8: audition a time window of the SAME piece.
+
+    The full piece is generated first -- identical RNG stream, cost routing,
+    and amp gains as a full render -- and this transform then selects the
+    window. That ordering is the point: the window is a view of the piece,
+    not a different piece, and a --replay token windows the composition it
+    names.
+
+    Edge policy: a note starting inside [from, to) is kept and shifted. A
+    note STILL SOUNDING at `from` is kept with its start clamped to the edge
+    and its duration cut to the remainder -- the sustaining material is
+    there, at the cost of a restarted envelope, which is the honest tradeoff
+    for auditioning mid-phrase. Struck instruments (ring-down tau) whose
+    attack lies more than 3*tau before the edge have rung out and are
+    skipped. Notes starting before `to` keep their FULL tails; the bus stays
+    open past the window exactly as it does past a full piece.
+
+    Rooms: the step active at `from` becomes the t=0 room; later steps
+    shift; steps at or past `to` drop (their material is not in the window).
+
+    Tails inherit the full-piece contract: everything ends before the bus
+    closes at window + 12 s. Without this clamp a 40-second tail keeps the
+    performance alive for half a minute past the closed bus -- rendered
+    silence appended to every audition.
+    """
+    span = to_s - from_s
+    kept: list[Event] = []
+    clipped = 0
+    rung_out = 0
+    for e in events:
+        if e.start >= to_s:
+            continue
+        if e.start >= from_s:
+            st = e.start - from_s
+            kept.append(replace(e, start=st,
+                                dur=min(e.dur, span + 12.0 - st)))
+            continue
+        end = e.start + e.dur
+        if end <= from_s:
+            continue
+        tau = INSTR_TAU.get(e.instr)
+        if tau is not None and (from_s - e.start) > 3.0 * tau:
+            rung_out += 1
+            continue
+        kept.append(replace(e, start=0.0,
+                            dur=min(end - from_s, span + 12.0)))
+        clipped += 1
+
+    wrooms = trim_timed(rooms, from_s, to_s)
+
+    return kept, wrooms, {"kept": len(kept), "clipped": clipped,
+                          "rung_out": rung_out}
+
+
+def trim_timed(rows: list, from_s: float, to_s: float) -> list:
+    """Window a (t, *rest) row list: the row active at from_s becomes t=0,
+    interior rows shift, rows at/past to_s drop. Shared by the room table
+    and (Phase 14) the resonator field table."""
+    active = None
+    out = []
+    for row in rows:
+        t = row[0]
+        if t <= from_s:
+            active = row
+        elif t < to_s:
+            out.append((t - from_s,) + tuple(row[1:]))
+    if active is not None:
+        out.insert(0, (0.0,) + tuple(active[1:]))
+    return out
+
+
+def reso_table(sec_fields: list) -> str:
+    """giReso (f 901): rows of (t_start, d1..d4) -- the four degrees the
+    Phase 14 resonator units track per section. First four sorted pitch
+    classes of the field, padded cyclically when the field is smaller.
+    Same GEN-2 / -1-terminated shape as the room table."""
+    rows = []
+    for (t, pcs) in sec_fields:
+        four = [pcs[i % len(pcs)] for i in range(4)] if pcs else [0, 0, 0, 0]
+        rows += [f"{t:.4f}"] + [str(d) for d in four]
+    rows += ["-1", "0", "0", "0", "0"]
+    vals = " ".join(rows)
+    n = len(rows)
+    size = -(n)          # negative size: exact, no power-of-2 padding
+    return f"f 901 0 {size} -2 {vals}"
+
+
 def rooms_table(rooms: list) -> str:
     """giRooms: rows of (t_start, fb_scale, cut_scale, width), terminated by a
     t=-1 row. Built score-side because only the score knows the section
@@ -844,7 +1175,9 @@ def rooms_table(rooms: list) -> str:
     return f"f 900 0 -{size} -2 {vals}"
 
 
-def build_sco(cfg: Config, events: list[Event], stats: dict) -> str:
+def build_sco(cfg: Config, events: list[Event], stats: dict,
+              score_dur: float | None = None) -> str:
+    sdur = cfg.dur_sec if score_dur is None else score_dur
     lines = [
         "; ---- Orange Fur score ------------------------------------------",
         f"; seed tag {cfg.seed}   nodes {cfg.nodes}   notes {len(events)}",
@@ -858,16 +1191,18 @@ def build_sco(cfg: Config, events: list[Event], stats: dict) -> str:
         "",
         "; room table: (t, fb_scale, cut_scale, width) per section, t=-1 ends",
         rooms_table(stats.get("rooms", [])),
+        "; reso table: (t, d1..d4) field degrees per section, t=-1 ends",
+        reso_table(stats.get("sec_fields", [])),
         "",
-        f"i 90 0 {cfg.dur_sec + 8:.3f}          ; air bed",
-        f"i 99 0 {cfg.dur_sec + 12:.3f}         ; master bus (+ reverb tail)",
+        f"i 90 0 {sdur + 8:.3f}          ; air bed",
+        f"i 99 0 {sdur + 12:.3f}         ; master bus (+ reverb tail)",
         "",
     ]
     for e in events:
         lines.append(
             f"i {e.instr} {e.start:.4f} {e.dur:.4f} {e.index} "
             f"{e.amp:.6f} {e.pan:.4f} {e.send:.4f} {e.slew:.4f} {e.wave} "
-            f"{e.glide:.4f} {e.gcurve:.4f}"
+            f"{e.glide:.4f} {e.gcurve:.4f} {e.det:.4f}"
         )
     lines.append("")
     lines.append("e")

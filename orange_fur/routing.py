@@ -200,6 +200,37 @@ def u_tapestop(rng) -> Unit:
                 gain=0.9, smear=0.4, cost=5.0)
 
 
+def u_streson(rng) -> Unit:
+    """Phase 14: FIELD-TUNED STRING RESONATORS. Two or three streson voices
+    per channel, each tracking one of the section's four field degrees (from
+    giReso, written by the score) at a drawn octave. Near-unity small-signal
+    gain via the classic (1 - fb) makeup; fb bounded at 0.92 (P3's feedback-
+    safety lesson: rails at build time, not hope at render time). The tank
+    RINGS on the harmony of whatever section is playing -- score-domain
+    delays and field-conformant material feed a tank tuned to the same
+    degrees, which is the compound payoff this arc was pointed at."""
+    nv = rng.choice([2, 2, 3])
+    return Unit("streson",
+                dict(nv=nv,
+                     sel=[rng.randrange(4) for _ in range(3)],
+                     oct=[rng.choice([-1, 0, 0, 1]) for _ in range(3)],
+                     fb=min(0.92, rng.uniform(0.70, 0.92)),
+                     port=rng.uniform(0.08, 0.30)),
+                gain=1.1, smear=0.5, cost=6.0)
+
+
+def u_modes(rng) -> Unit:
+    """Phase 14: FIELD-TUNED MODAL BANK. Four mode filters on the section's
+    field degrees across drawn octaves. mode's resonance gain scales with Q,
+    so each voice is scaled by 1/Q (calibrated; see test_p14) -- P3's
+    balance-calibration lesson applied at construction."""
+    return Unit("modes",
+                dict(q=rng.uniform(60.0, 180.0),
+                     oct=[rng.choice([-1, 0, 0, 1]) for _ in range(4)],
+                     port=rng.uniform(0.08, 0.25)),
+                gain=1.0, smear=0.35, cost=5.0)
+
+
 def u_busconv(rng) -> Unit:
     return Unit("busconv",
                 dict(size=rng.choice([128, 256, 512]),
@@ -209,9 +240,12 @@ def u_busconv(rng) -> Unit:
 
 
 UNIT_DRAWS = [u_shimmer, u_spring, u_phaser, u_flanger,
-              u_resbp, u_tapestop, u_busconv]
+              u_resbp, u_tapestop, u_busconv,
+              u_streson, u_modes]          # Phase 14: field-tuned resonators
 
-ROOMY = {"shimmer", "spring"}
+# streson at fb 0.9 accumulates energy like a small tank; modes ring
+# briefly (Q/(pi*f) ~ a quarter second) and pass through
+ROOMY = {"shimmer", "spring", "streson"}
 
 
 def generate_routing(rng: random.Random) -> Routing:
@@ -253,6 +287,25 @@ def generate_routing(rng: random.Random) -> Routing:
 
 
 # --------------------------------------------------------- code generation
+def _reso_scan(cid: str) -> str:
+    """k-rate scan of giReso (rows: t, d1..d4) -- the exact giRooms idiom.
+    Each resonator instance keeps its own row cursor."""
+    return f"""
+  kd0_{cid} init 0
+  kd1_{cid} init 0
+  kd2_{cid} init 0
+  kd3_{cid} init 0
+  kri_{cid} init 0
+  krt_{cid} table kri_{cid} * 5, giReso
+  if krt_{cid} >= 0 && ktime >= krt_{cid} then
+    kd0_{cid} table kri_{cid} * 5 + 1, giReso
+    kd1_{cid} table kri_{cid} * 5 + 2, giReso
+    kd2_{cid} table kri_{cid} * 5 + 3, giReso
+    kd3_{cid} table kri_{cid} * 5 + 4, giReso
+    kri_{cid} = kri_{cid} + 1
+  endif"""
+
+
 def _unit_code(u: Unit, cid: str, inl: str, inr: str,
                is_room: bool) -> tuple[str, str, str]:
     """Csound block for one unit. Returns (code, outL, outR). cid is a unique
@@ -325,6 +378,62 @@ def _unit_code(u: Unit, cid: str, inl: str, inr: str,
             delayw  {inr}
   {ol}  =  atp{cid}L * {p['mix']:.3f} + {inl} * {1 - p['mix']:.3f}
   {orr}  =  atp{cid}R * {p['mix']:.3f} + {inr} * {1 - p['mix']:.3f}"""
+    elif u.kind == "streson":
+        nv = p["nv"]
+        fb = p["fb"]
+        scan = _reso_scan(cid)
+        vl, vr = [], []
+        for v in range(nv):
+            sel, octv = p["sel"][v], p["oct"][v]
+            code_v = f"""
+  kix{cid}v{v}  =  gibasekey + kd{sel}_{cid} + {octv} * giGrades
+  kcp{cid}v{v}  cpstun 1, kix{cid}v{v}, giTun
+  ; port half-time ramps from 0: instant tracking at init (portk otherwise
+  ; glides every resonator up from silence for seconds), drawn value after
+  kht{cid}v{v}  linseg 0, 0.08, {p['port']:.3f}
+  kcp{cid}v{v}  portk  kcp{cid}v{v}, kht{cid}v{v}
+  asl{cid}v{v}  streson {inl}, kcp{cid}v{v}, {fb:.3f}
+  asr{cid}v{v}  streson {inr}, kcp{cid}v{v}, {fb:.3f}"""
+            scan += code_v
+            vl.append(f"asl{cid}v{v}")
+            vr.append(f"asr{cid}v{v}")
+        mk = (1.0 - fb) / nv          # classic streson makeup, averaged
+        code = scan + f"""
+  {ol}   =  ({' + '.join(vl)}) * {mk:.4f}
+  {orr}  =  ({' + '.join(vr)}) * {mk:.4f}
+  {ol}   dcblock2 {ol}
+  {orr}  dcblock2 {orr}
+  {ol}   buthp  {ol}, 45
+  {orr}  buthp  {orr}, 45"""
+        return code, ol, orr
+
+    elif u.kind == "modes":
+        q = p["q"]
+        scan = _reso_scan(cid)
+        vl, vr = [], []
+        for v in range(4):
+            octv = p["oct"][v]
+            code_v = f"""
+  kix{cid}v{v}  =  gibasekey + kd{v}_{cid} + {octv} * giGrades
+  kcp{cid}v{v}  cpstun 1, kix{cid}v{v}, giTun
+  kht{cid}v{v}  linseg 0, 0.08, {p['port']:.3f}
+  kcp{cid}v{v}  portk  kcp{cid}v{v}, kht{cid}v{v}
+  aml{cid}v{v}  mode  {inl}, kcp{cid}v{v}, {q:.1f}
+  amr{cid}v{v}  mode  {inr}, kcp{cid}v{v}, {q:.1f}"""
+            scan += code_v
+            vl.append(f"aml{cid}v{v}")
+            vr.append(f"amr{cid}v{v}")
+        # mode's gain AT resonance ~ Q, so unity makeup is 1/Q per voice;
+        # the extra /2 is summing headroom for 4 voices (calibrated by the
+        # click test in test_p14: 1/sqrt(Q) left ~ +5 dB at Q 150)
+        mk = 1.0 / (2.0 * max(1.0, q))
+        code = scan + f"""
+  {ol}   =  ({' + '.join(vl)}) * {mk:.5f}
+  {orr}  =  ({' + '.join(vr)}) * {mk:.5f}
+  {ol}   dcblock2 {ol}
+  {orr}  dcblock2 {orr}"""
+        return code, ol, orr
+
     elif u.kind == "busconv":
         size = p["size"]
         q = float(2 ** (p["bits"] - 1))

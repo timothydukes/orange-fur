@@ -135,8 +135,8 @@ def test_end_to_end():
         ev, meta = graph_events(cfg, sol, rng)
 
         check(f"e2e: N={nodes} count within 35% of budget",
-              abs(len(ev) - sol.budget) <= max(12, 0.35 * sol.budget),
-              (len(ev), sol.budget))
+              abs(sum(1 for _e in ev if _e.echo == 0) - sol.budget) <= max(12, 0.35 * sol.budget),
+              (sum(1 for _e in ev if _e.echo == 0), sol.budget))
         check(f"e2e: N={nodes} heads inside, spill <= +4s, end <= +12s",
               all(0 <= e.start <= cfg.dur_sec + 4.0 for e in ev)
               and all(e.start + e.dur <= cfg.dur_sec + 12.0 + 1e-6 for e in ev))

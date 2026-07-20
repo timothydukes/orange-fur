@@ -33,6 +33,10 @@ has to special-case an instrument:
    p10 glide  (Phase 5: pitch-glide target as an OFFSET IN SCALE DEGREES.
                0 = no glide, and every pre-Phase-5 score is bit-identical.)
    p11 curve  (transeg curve for the glide: 0 linear, +/- convex/concave)
+   p12 det    (Phase 9: detune in CENTS, applied after the tuning lookup --
+               the first officially off-scale pitch. 0 = on the scale, and
+               every pre-Phase-9 score is bit-identical. Baked-partial
+               templates ride it rigidly via kgl.)
 """
 
 from __future__ import annotations
@@ -62,7 +66,10 @@ gaSendR  init 0
 giTun    =     {tun_tab}                    ; GEN -2 table, defined in the score
 giSine   ftgen {sine_tab}, 0, 65537, 10, 1
 giRooms  =     900                          ; room table, written by the score
+giReso   =     901                          ; Phase 14: per-section field degrees
+                                            ; (t, d1..d4 rows), written by the score
 giGrades =     {grades}                     ; scale degrees per repeat interval
+gibasekey =    {basekey}                    ; Phase 14: resonators map degrees
 """
 
 INSTRUMENTS = """
@@ -392,6 +399,7 @@ def build_orc(cfg: Config, ceiling: float, orch_text: str | None = None,
         tun_tab=TUNING_TABLE,
         sine_tab=SINE_TABLE,
         grades=cfg.scale.numgrades,
+        basekey=cfg.scale.basekey,
     )
     body = INSTRUMENTS.format(ceiling=ceiling)
     if routing is not None and orch_text is not None:
