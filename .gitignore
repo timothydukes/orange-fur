@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.wav
+*.csd
+out/
+.DS_Store
+orange_fur_library.json

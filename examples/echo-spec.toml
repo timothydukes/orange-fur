@@ -1,0 +1,66 @@
+# orange-fur --echo-spec example (schema 1)
+# Omit any table or key to keep its default; defaults reproduce the
+# pre-P17 echo behavior exactly. Unknown keys are rejected.
+# NOTE: timing-family WEIGHTS live under [echo.timing.weights] (a scalar
+# `uniform` and a table [echo.timing.uniform] cannot coexist in TOML).
+
+schema = 1
+
+[echo]
+scale = 1.0                   # composes with --echo SCALE (both multiply)
+max_notes_per_pattern = 96    # hard cap, second order included
+second_order = "off"          # off | drawn | always
+
+[echo.modes]                  # pitch behavior weights
+plain = 0.30
+degrees = 0.30
+octave = 0.15
+cents = 0.25
+
+[echo.timing.weights]         # timing-family weights
+uniform = 0.55
+multitap = 0.20
+euclid = 0.15
+ramp = 0.10
+
+[echo.timing.uniform]
+delay = [0.10, 1.00]
+fb = [0.40, 0.80]
+
+[echo.timing.multitap]
+taps = [2, 5]
+cycle = [0.3, 1.6]
+fb = [0.45, 0.80]
+
+[echo.timing.euclid]
+pulses = [3, 7]
+steps = [8, 16]
+cycle = [0.8, 2.4]
+fb = [0.45, 0.80]
+
+[echo.timing.ramp]
+delay0 = [0.12, 0.70]
+ratio = [0.78, 1.28]          # <1 accelerates (pitch rises), >1 decelerates
+fb = [0.50, 0.85]
+pitch_couple = true
+
+[echo.pan]
+inherit = 0.65
+pingpong = 0.25
+rotate = 0.10
+
+[echo.rotation]
+prob = 0.35
+len = [2, 4]
+
+[echo.gestures]
+flat = 0.45
+up = 0.20
+down = 0.20
+arch = 0.15
+
+[echo.varispeed]              # Phase 18: tape-speed automation on echo
+enabled = false               # trains (loops are protected). Additive to
+prob = 0.4                    # schema 1 -- older spec files stay valid.
+depth = [100.0, 500.0]        # max deviation, cents (±)
+segments = [3, 6]             # automation segments per section
